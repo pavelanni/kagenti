@@ -1827,6 +1827,42 @@ def _ensure_authbridge_configmaps(
     )
 
 
+def _ensure_card_unsigned_configmap(
+    kube: KubernetesService,
+    name: str,
+    namespace: str,
+    service_port: int = DEFAULT_IN_CLUSTER_PORT,
+) -> None:
+    """Create the <agent>-card-unsigned ConfigMap if it does not exist.
+
+    The Kagenti operator webhook checks for this ConfigMap when a
+    Deployment is admitted.  If it exists, the webhook injects a
+    ``sign-agentcard`` init container that signs the agent card with
+    the workload's SPIRE SVID.  The ConfigMap must therefore be
+    created **before** the Deployment.
+    """
+    agent_url = (
+        f"http://{name}.{namespace}.svc.cluster.local:{service_port}"
+    )
+    agent_card = json.dumps(
+        {
+            "name": name,
+            "url": agent_url,
+            "version": "1.0.0",
+            "capabilities": {},
+            "defaultInputModes": ["application/json"],
+            "defaultOutputModes": ["text/plain"],
+            "skills": [],
+        },
+        indent=2,
+    )
+    kube.ensure_configmap(
+        namespace=namespace,
+        name=f"{name}-card-unsigned",
+        data={"agent.json": agent_card},
+    )
+
+
 def _build_agent_shipwright_build_manifest(
     request: CreateAgentRequest, clone_secret_name: Optional[str] = None
 ) -> dict:
@@ -2397,6 +2433,21 @@ async def create_agent(
                     spire_enabled=request.spireEnabled,
                 )
 
+            # Create card-unsigned ConfigMap so the webhook injects
+            # the sign-agentcard init container at Deployment admission.
+            if request.spireEnabled:
+                service_port = (
+                    request.servicePorts[0].port
+                    if request.servicePorts
+                    else DEFAULT_IN_CLUSTER_PORT
+                )
+                _ensure_card_unsigned_configmap(
+                    kube=kube,
+                    name=request.name,
+                    namespace=request.namespace,
+                    service_port=service_port,
+                )
+
             # Create workload based on workloadType
             if request.workloadType == WORKLOAD_TYPE_DEPLOYMENT:
                 workload_manifest = _build_deployment_manifest(
@@ -2791,6 +2842,21 @@ async def finalize_shipwright_build(
                 kube=kube,
                 namespace=namespace,
                 spire_enabled=final_spire_enabled,
+            )
+
+        # Create card-unsigned ConfigMap so the webhook injects
+        # the sign-agentcard init container at Deployment admission.
+        if final_spire_enabled:
+            service_port = (
+                final_service_ports[0].port
+                if final_service_ports
+                else DEFAULT_IN_CLUSTER_PORT
+            )
+            _ensure_card_unsigned_configmap(
+                kube=kube,
+                name=name,
+                namespace=namespace,
+                service_port=service_port,
             )
 
         # Create workload based on workloadType
