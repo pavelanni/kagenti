@@ -77,7 +77,7 @@ from app.models.responses import (
     DeleteResponse,
 )
 from app.services.kubernetes import KubernetesService, get_kubernetes_service
-from app.utils.routes import create_route_for_agent_or_tool, route_exists
+from app.utils.routes import create_route_for_agent_or_tool, detect_platform, route_exists
 from app.models.shipwright import (
     ResourceType,
     ShipwrightBuildConfig,
@@ -1863,6 +1863,56 @@ def _ensure_card_unsigned_configmap(
     )
 
 
+def _ensure_authbridge_scc_rolebinding(
+    kube: KubernetesService,
+    namespace: str,
+) -> None:
+    """On OpenShift, ensure the AuthBridge SCC RoleBinding exists.
+
+    AuthBridge sidecars need NET_ADMIN/NET_RAW capabilities, RunAsAny UIDs,
+    and CSI volumes that OpenShift's default restricted-v2 SCC blocks.
+    The Helm chart creates the ``kagenti-authbridge`` SCC and its ClusterRole;
+    this function creates the per-namespace RoleBinding that grants it to all
+    service accounts in the namespace.
+
+    On non-OpenShift clusters this is a no-op.  If the ClusterRole doesn't
+    exist (SCC not installed), a warning is logged and the function returns
+    without error — the agent will still be created, but pods may fail with
+    SCC errors until the SCC is installed.
+    """
+    if detect_platform(kube) != "openshift":
+        return
+
+    cluster_role_name = "system:openshift:scc:kagenti-authbridge"
+
+    # Verify the ClusterRole exists (implies the SCC was installed)
+    try:
+        kube.rbac_api.read_cluster_role(name=cluster_role_name)
+    except Exception:
+        logger.warning(
+            f"ClusterRole '{cluster_role_name}' not found. "
+            "The kagenti-authbridge SCC may not be installed. "
+            "Agent pods may fail with SCC errors. "
+            "Install via: helm upgrade kagenti charts/kagenti --set openshift=true"
+        )
+        return
+
+    import kubernetes.client as k8s_client
+
+    kube.ensure_rolebinding(
+        namespace=namespace,
+        name="agent-authbridge-scc",
+        cluster_role_name=cluster_role_name,
+        subjects=[
+            k8s_client.V1Subject(
+                kind="Group",
+                api_group="rbac.authorization.k8s.io",
+                name=f"system:serviceaccounts:{namespace}",
+            ),
+        ],
+    )
+
+
 def _build_agent_shipwright_build_manifest(
     request: CreateAgentRequest, clone_secret_name: Optional[str] = None
 ) -> dict:
@@ -2433,6 +2483,12 @@ async def create_agent(
                     spire_enabled=request.spireEnabled,
                 )
 
+            # On OpenShift, ensure the AuthBridge SCC RoleBinding exists
+            if request.authBridgeEnabled:
+                _ensure_authbridge_scc_rolebinding(
+                    kube=kube, namespace=request.namespace
+                )
+
             # Create card-unsigned ConfigMap so the webhook injects
             # the sign-agentcard init container at Deployment admission.
             if request.spireEnabled:
@@ -2842,6 +2898,12 @@ async def finalize_shipwright_build(
                 kube=kube,
                 namespace=namespace,
                 spire_enabled=final_spire_enabled,
+            )
+
+        # On OpenShift, ensure the AuthBridge SCC RoleBinding exists
+        if final_auth_bridge:
+            _ensure_authbridge_scc_rolebinding(
+                kube=kube, namespace=namespace
             )
 
         # Create card-unsigned ConfigMap so the webhook injects
